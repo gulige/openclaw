@@ -7,9 +7,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(dirname "$SCRIPT_DIR")"
+# OpenClaw repo root: .../openclaw/skills/workclaws-worker -> ../..
+OPENCLAW_ROOT="$(cd "$(dirname "$(dirname "$SKILL_DIR")")" && pwd)"
+export OPENCLAW_ROOT
 
 # --- defaults ---
-PLATFORM_URL="${WORKCLAWS_PLATFORM_URL:-}"
+PLATFORM_URL="${WORKCLAWS_PLATFORM_URL:-https://yesclaw.ai/api/admin/proxy}"
 ENROLLMENT_TOKEN="${WORKCLAWS_ENROLLMENT_TOKEN:-}"
 NODE_ID="${WORKCLAWS_NODE_ID:-}"
 MAX_CONCURRENCY="${WORKCLAWS_MAX_CONCURRENCY:-2}"
@@ -76,12 +79,21 @@ api_call() {
   local token
   token=$(get_access_token)
   local trace_id="trc_$(date +%s)_$$"
-  curl -sf -X "$method" \
+  local raw
+  raw=$(curl -sf -X "$method" \
     -H "Authorization: Bearer $token" \
     -H "Content-Type: application/json" \
     -H "X-Trace-Id: $trace_id" \
     "$@" \
-    "${PLATFORM_URL}${path}"
+    "${PLATFORM_URL}${path}") || return 1
+  echo "$raw" | node -e "
+    const r = JSON.parse(require('fs').readFileSync('/dev/stdin','utf8'));
+    if (r.success === false) {
+      console.error('[workclaws] API error:', JSON.stringify(r.error || r));
+      process.exit(1);
+    }
+    process.stdout.write(JSON.stringify(r.data !== undefined ? r.data : r));
+  "
 }
 
 # --- capability introspection ---
@@ -101,8 +113,10 @@ const caps = {
   platform: { os: process.platform, arch: process.arch }
 };
 
+const root = process.env.OPENCLAW_ROOT || process.cwd();
+
 // Detect installed skills
-const skillsDir = path.resolve('skills');
+const skillsDir = path.join(root, 'skills');
 if (fs.existsSync(skillsDir)) {
   caps.skills = fs.readdirSync(skillsDir)
     .filter(d => {
@@ -112,7 +126,7 @@ if (fs.existsSync(skillsDir)) {
 }
 
 // Detect extensions
-const extDir = path.resolve('extensions');
+const extDir = path.join(root, 'extensions');
 if (fs.existsSync(extDir)) {
   caps.extensions = fs.readdirSync(extDir)
     .filter(d => {
@@ -193,9 +207,32 @@ cmd_enroll() {
     -d "{\"node_id\": \"$nid\"}" \
     "${PLATFORM_URL}/v1/nodes/enroll") || die "Enrollment request failed"
 
-  write_cred "$resp"
+  ensure_cred_dir
+  echo "$resp" | node -e "
+    const fs = require('fs');
+    const r = JSON.parse(fs.readFileSync('/dev/stdin', 'utf8'));
+    if (!r.success || !r.data) {
+      console.error('Enrollment rejected:', JSON.stringify(r));
+      process.exit(1);
+    }
+    const d = r.data;
+    const out = {
+      node_id: d.node_id,
+      access_token: d.access_token,
+      refresh_token: d.refresh_token,
+      expires_in: d.expires_in,
+      token_type: d.token_type || 'Bearer'
+    };
+    fs.writeFileSync(process.argv[1], JSON.stringify(out, null, 2));
+  " "$CRED_FILE" || die "Could not parse enrollment response"
+  chmod 600 "$CRED_FILE"
   info "Enrolled successfully. Credentials stored in $CRED_FILE"
-  echo "$resp" | node -e "const d=JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')); console.log('Node ID:', d.node_id); console.log('Token expires in:', d.expires_in, 'seconds');"
+  echo "$resp" | node -e "
+    const d = JSON.parse(require('fs').readFileSync('/dev/stdin', 'utf8'));
+    const x = d.data || d;
+    console.log('Node ID:', x.node_id);
+    console.log('Token expires in:', x.expires_in, 'seconds');
+  "
 }
 
 cmd_register() {
