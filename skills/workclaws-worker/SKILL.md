@@ -28,7 +28,7 @@ Enroll → Register (with capabilities) → Heartbeat loop → Pull assignments 
 
 | Variable | Required | Description |
 |---|---|---|
-| `WORKCLAWS_PLATFORM_URL` | Yes | Platform API base URL (e.g. `https://api.workclaws.io`) |
+| `WORKCLAWS_PLATFORM_URL` | Yes* | Platform API base URL. For **yesclaw.ai** (Next.js BFF), use `https://yesclaw.ai/api/admin/proxy` so `/v1/...` maps to the Erlang API. The script defaults to this if unset. |
 | `WORKCLAWS_ENROLLMENT_TOKEN` | Bootstrap | One-time enrollment token for first registration |
 | `WORKCLAWS_NODE_ID` | No | Override auto-generated node ID |
 | `WORKCLAWS_MAX_CONCURRENCY` | No | Max parallel assignments (default: 2) |
