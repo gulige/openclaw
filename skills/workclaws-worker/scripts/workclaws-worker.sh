@@ -349,6 +349,18 @@ cmd_status() {
   "
 }
 
+cmd_check_cancel() {
+  local task_id="$1"
+  local resp
+  resp=$(api_call GET "/v1/tasks/${task_id}/state" 2>/dev/null) || return 1
+  local state
+  state=$(echo "$resp" | node -e "
+    const d = JSON.parse(require('fs').readFileSync('/dev/stdin','utf8'));
+    process.stdout.write((d.data && d.data.state) || '');
+  " 2>/dev/null || echo "")
+  [[ "$state" == "cancelled" ]]
+}
+
 cmd_start() {
   require_platform_url
   local nid
@@ -412,10 +424,26 @@ execute_task() {
   local asg_id="$1" task_id="$2" payload_ref="$3"
   info "Executing task $task_id ..."
 
+  local cancel_flag="/tmp/workclaws_cancel_${task_id}"
+  rm -f "$cancel_flag"
+
+  # Background cancel-check loop: polls task state every 5s
+  (
+    while true; do
+      sleep 5
+      if cmd_check_cancel "$task_id" 2>/dev/null; then
+        touch "$cancel_flag"
+        info "Task $task_id cancelled by user — signalling abort"
+        break
+      fi
+      [[ -f "$cancel_flag" ]] && break
+    done
+  ) &
+  local cancel_checker_pid=$!
+
   local start_time
   start_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-  # Download and parse task payload, then execute via openclaw agent
   local result_ref="local://results/${task_id}.json"
   local outcome="success"
   local quality_score=85
@@ -434,15 +462,33 @@ execute_task() {
 
     if [[ -n "$task_prompt" ]]; then
       local agent_result
-      if agent_result=$(openclaw agent --message "$task_prompt" --print 2>&1); then
-        outcome="success"
-        quality_score=90
-        echo "$agent_result" > "/tmp/workclaws_result_${task_id}.json"
-        result_ref="local://results/${task_id}.json"
-      else
-        outcome="failure"
-        quality_score=0
-        error_code="TOOL_EXECUTION_FAILED"
+      openclaw agent --message "$task_prompt" --print > "/tmp/workclaws_result_${task_id}.json" 2>&1 &
+      local agent_pid=$!
+
+      # Wait for either agent completion or cancellation
+      while kill -0 "$agent_pid" 2>/dev/null; do
+        if [[ -f "$cancel_flag" ]]; then
+          kill "$agent_pid" 2>/dev/null || true
+          wait "$agent_pid" 2>/dev/null || true
+          outcome="failure"
+          quality_score=0
+          error_code="TASK_CANCELLED_BY_USER"
+          info "Task $task_id: agent process killed due to cancellation"
+          break
+        fi
+        sleep 1
+      done
+
+      if [[ "$error_code" != "TASK_CANCELLED_BY_USER" ]]; then
+        if wait "$agent_pid" 2>/dev/null; then
+          outcome="success"
+          quality_score=90
+          result_ref="local://results/${task_id}.json"
+        else
+          outcome="failure"
+          quality_score=0
+          error_code="TOOL_EXECUTION_FAILED"
+        fi
       fi
     else
       outcome="failure"
@@ -454,6 +500,11 @@ execute_task() {
     quality_score=0
     error_code="OPENCLAW_NOT_AVAILABLE"
   fi
+
+  # Stop the cancel-checker
+  kill "$cancel_checker_pid" 2>/dev/null || true
+  wait "$cancel_checker_pid" 2>/dev/null || true
+  rm -f "$cancel_flag"
 
   info "Task $task_id completed: $outcome"
   cmd_submit_receipt "$asg_id" "$task_id" "$outcome" "$result_ref" "$quality_score" "$error_code" \
@@ -475,7 +526,8 @@ case "$cmd" in
   settlements) cmd_settlements ;;
   claim)       cmd_claim "$@" ;;
   status)      cmd_status ;;
-  start)       cmd_start ;;
+  start)        cmd_start ;;
+  cancel-check) cmd_check_cancel "$@" && echo "cancelled" || echo "active" ;;
   capabilities) discover_capabilities ;;
   *)
     echo "Usage: workclaws-worker.sh <command>"
@@ -490,6 +542,7 @@ case "$cmd" in
     echo "  pull          Pull one assignment"
     echo "  ack <id>      ACK an assignment"
     echo "  submit <assignment_id> <task_id> <outcome> <result_ref> [quality_score] [error_code]"
+    echo "  cancel-check <task_id>  Check if a task has been cancelled"
     echo "  settlements   List approved settlements"
     echo "  claim <id>    Claim a settlement"
     exit 1
