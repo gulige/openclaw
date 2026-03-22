@@ -4,10 +4,8 @@ description: "WorkClaws platform worker integration: register capabilities, acce
 metadata:
   {
     "openclaw": {
-      "emoji": "🦞",
-      "primaryEnv": "WORKCLAWS_ENROLLMENT_TOKEN",
-      "requires": { "env": ["WORKCLAWS_PLATFORM_URL"] }
-    },
+      "emoji": "🦞"
+    }
   }
 ---
 
@@ -24,16 +22,53 @@ registered workers based on their reported capabilities. This skill handles the 
 Enroll → Register (with capabilities) → Heartbeat loop → Pull assignments → Execute → Submit receipt → Claim settlement
 ```
 
+## OpenClaw UI: why it was “blocked” before
+
+OpenClaw treats `metadata.openclaw.requires.env` as **hard requirements**: if `WORKCLAWS_PLATFORM_URL` is listed there but not set in the process environment, the skill shows **blocked** and `Missing: env:WORKCLAWS_PLATFORM_URL`. The worker script already applies a default URL when the variable is unset, so that requirement was removed—**the skill should show eligible without any env**.
+
+`primaryEnv` is wired to the Control UI **API key** field (`skills.entries.<name>.apiKey`). This skill is **not** an LLM API key skill. The one-time **`WORKCLAWS_ENROLLMENT_TOKEN`** is only for `enroll` and must not be confused with provider keys—`primaryEnv` was removed to avoid that prompt.
+
+To point at production (optional), set env once (shell, systemd, or OpenClaw config). **Workers do not use OSS access keys**: the portal BFF issues presigned URLs for attachment download and result upload (`WORKCLAWS_PORTAL_URL`).
+
+```json
+"skills": {
+  "entries": {
+    "workclaws-worker": {
+      "env": {
+        "WORKCLAWS_PLATFORM_URL": "https://yesclaw.ai/api/admin/proxy",
+        "WORKCLAWS_PORTAL_URL": "https://yesclaw.ai"
+      }
+    }
+  }
+}
+```
+
+Use `WORKCLAWS_ENROLLMENT_TOKEN` only in the shell when running `scripts/workclaws-worker.sh enroll` the first time (do not commit it).
+
 ## Environment Variables
 
 | Variable | Required | Description |
 |---|---|---|
-| `WORKCLAWS_PLATFORM_URL` | Yes* | Platform API base URL. For **yesclaw.ai** (Next.js BFF), use `https://yesclaw.ai/api/admin/proxy` so `/v1/...` maps to the Erlang API. The script defaults to this if unset. |
+| `WORKCLAWS_PLATFORM_URL` | No | Platform Erlang API base URL. Defaults to `https://yesclaw.ai/api/admin/proxy`. Set to `http://127.0.0.1:18790` for local API. |
 | `WORKCLAWS_ENROLLMENT_TOKEN` | Bootstrap | One-time enrollment token for first registration |
 | `WORKCLAWS_NODE_ID` | No | Override auto-generated node ID |
 | `WORKCLAWS_MAX_CONCURRENCY` | No | Max parallel assignments (default: 2) |
 | `WORKCLAWS_REGION` | No | Region label for routing (default: auto-detect) |
 | `WORKCLAWS_TIER` | No | Service tier: `standard` or `premium` (default: `standard`) |
+| `WORKCLAWS_OUTPUT_DIR` | No | Parent directory for per-task deliverable folders (`workclaws_output_<task_id>`). Defaults to `/tmp` |
+| `WORKCLAWS_PORTAL_URL` | No | Next.js portal base URL (BFF). Used for `GET .../attachment-urls` and `POST .../result-upload-url` presign flows. Defaults to `https://yesclaw.ai` |
+| `WORKCLAWS_DEBUG` | No | Set to `1` or `true` to log each API call’s HTTP status and body size on stderr (`[workclaws][debug]`). Failures also emit `[workclaws][trace]` lines. |
+| `WORKCLAWS_TOKEN_REFRESH_RETRIES` | No | Retries for `/v1/nodes/token/refresh` on network/5xx (default `5`). |
+| `WORKCLAWS_TOKEN_REFRESH_BACKOFF` | No | Seconds between refresh retries (default `3`). |
+| `WORKCLAWS_API_401_REFRESH_ROUNDS` | No | On HTTP 401, max cycles of refresh + replay per request (default `5`). |
+| `WORKCLAWS_ACK_RETRIES` | No | After pull, ACK attempts before giving up (default `5`). |
+| `WORKCLAWS_ACK_BACKOFF` | No | Seconds between ACK retries (default `2`). |
+
+The worker uploads the deliverable zip with a **presigned PUT** from `POST /api/worker/task/:taskId/result-upload-url` (node Bearer token), then PUTs bytes **directly to OSS**. Attachments use **presigned GET** from `GET /api/worker/task/:taskId/attachment-urls`. No `pip install oss2` or OSS keys on the worker machine. The Next.js server holds OSS credentials and enforces assignment checks before signing.
+
+### No assignments / “pull looks empty”
+
+The worker used to hide pull errors and silently fall back to an empty queue. **Failures now print a normal `[workclaws]` line**; use `WORKCLAWS_DEBUG=1` to see HTTP codes. If pulls succeed but the queue stays empty, check: the task is **issued** for **this** `WORKCLAWS_NODE_ID` (or the ID in `~/.openclaw/workclaws-credentials.json`), routing and **required_skills** match what you registered, and the node has completed **register** + heartbeat.
 
 ## Quick Start
 
@@ -99,14 +134,16 @@ Provider/model pairs with traits (reasoning, vision, coding) and context window 
 
 When a task is pulled from the platform:
 
-1. Validate the assignment payload against node capabilities
-2. Download task payload from `payload_ref`
-3. Route to appropriate tool/skill execution path
-4. Capture structured result and quality metrics
-5. Upload result to `result_ref` storage
-6. Submit execution receipt with outcome, timing, and quality score
+1. ACK the assignment to accept it
+2. Fetch full task detail from `GET /v1/tasks/:id` (prompt, title, attachments)
+3. Download task attachments (if any): call `GET {WORKCLAWS_PORTAL_URL}/api/worker/task/:taskId/attachment-urls` with the node access token; BFF returns presigned GET URLs; save files under `/tmp/workclaws_attachments_<task_id>/`
+4. Create a **deliverables directory** (default `${WORKCLAWS_OUTPUT_DIR:-/tmp}/workclaws_output_<task_id>/`) and instruct the agent to save all final artifacts (images, SVG, PDF, etc.) there—not only in chat
+5. Execute via `openclaw agent --message <prompt>` with attachment paths in context
+6. After success: **zip** that directory, call `POST .../result-upload-url` for a presigned PUT, upload to `output/{task_id}/result.zip` on OSS, and set `result_ref` to the **object key** in the receipt. The agent JSON transcript is not the primary deliverable
+7. If the directory has no files: submit a **failure** receipt (`NO_DELIVERABLES`). If files exist but upload still fails after retries: **do not** submit failure; queue under `~/.openclaw/pending_deliveries/` and retry from the heartbeat loop or `scripts/workclaws-worker.sh retry-deliveries`
+8. Submit the execution receipt (skipped while a delivery is still pending)
 
-For long-running tasks, the script sends progress heartbeats to keep the assignment alive.
+For long-running tasks, a background cancel-checker polls task state every 5s.
 
 ## Error Handling
 
