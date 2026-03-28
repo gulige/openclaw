@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../../src/config/config.js";
 import type { ResolvedAgentRoute } from "../../../src/routing/resolve-route.js";
 import type { TelegramBotDeps } from "./bot-deps.js";
@@ -209,6 +209,7 @@ function registerAndResolveCommandHandlerBase(params: {
       byProvider: new Map<string, Set<string>>(),
       providers: [],
       resolvedDefault: { provider: "openai", model: "gpt-4.1" },
+      modelNames: new Map<string, string>(),
     })),
     listSkillCommandsForAgents: vi.fn(() => []),
     wasSentByBot: vi.fn(() => false),
@@ -389,9 +390,12 @@ function expectUnauthorizedNewCommandBlocked(sendMessage: ReturnType<typeof vi.f
 }
 
 describe("registerTelegramNativeCommands — session metadata", () => {
-  beforeEach(async () => {
+  beforeAll(async () => {
     vi.resetModules();
     ({ registerTelegramNativeCommands } = await import("./bot-native-commands.js"));
+  });
+
+  beforeEach(() => {
     persistentBindingMocks.resolveConfiguredBindingRoute.mockClear();
     persistentBindingMocks.resolveConfiguredBindingRoute.mockImplementation(({ route }) =>
       createConfiguredBindingRoute(route, null),
